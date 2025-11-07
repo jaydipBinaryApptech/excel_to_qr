@@ -9,18 +9,20 @@ import 'package:flutter/rendering.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:excel/excel.dart';
 import 'package:barcode_widget/barcode_widget.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'dart:ui' as ui;
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 import 'package:image_gallery_saver/image_gallery_saver.dart';
+import 'package:archive/archive.dart';
 // ignore: avoid_web_libraries_in_flutter
 import 'dart:html' as html show AnchorElement;
 
 import 'firebase_options.dart';
 
 Future<void> main() async {
-  WidgetsFlutterBinding.ensureInitialized(); // ensures bindings are ready
+  WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   runApp(
     const MaterialApp(
@@ -42,6 +44,7 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
   List<String> _filteredValues = [];
   final TextEditingController _searchController = TextEditingController();
   final Map<String, GlobalKey> _barcodeKeys = {};
+  bool _isDownloading = false;
 
   @override
   void dispose() {
@@ -94,7 +97,6 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
       _cellValues = values;
       _filteredValues = values;
       _searchController.clear();
-      // Create keys for each barcode
       _barcodeKeys.clear();
       for (var value in values) {
         _barcodeKeys[value] = GlobalKey();
@@ -125,7 +127,33 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
     return 1;
   }
 
-  Future<void> _downloadAllAsPDF() async {
+  Future<Uint8List?> _captureBarcodeAsImage(String value) async {
+    try {
+      final key = _barcodeKeys[value];
+      if (key == null || key.currentContext == null) {
+        return null;
+      }
+
+      RenderRepaintBoundary boundary =
+          key.currentContext!.findRenderObject() as RenderRepaintBoundary;
+
+      ui.Image image = await boundary.toImage(pixelRatio: 3.0);
+      ByteData? byteData = await image.toByteData(
+        format: ui.ImageByteFormat.png,
+      );
+
+      if (byteData == null) {
+        return null;
+      }
+
+      return byteData.buffer.asUint8List();
+    } catch (e) {
+      print('Error capturing barcode: $e');
+      return null;
+    }
+  }
+
+  Future<void> _downloadAllAsZip() async {
     if (_cellValues.isEmpty) {
       ScaffoldMessenger.of(
         context,
@@ -133,90 +161,90 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
       return;
     }
 
-    final pdf = pw.Document();
+    setState(() {
+      _isDownloading = true;
+    });
 
-    // Add barcodes to PDF in grid format
-    for (int i = 0; i < _cellValues.length; i += 12) {
-      final chunk = _cellValues.skip(i).take(12).toList();
+    try {
+      // Create a ZIP archive
+      final archive = Archive();
 
-      pdf.addPage(
-        pw.Page(
-          pageFormat: PdfPageFormat.a4,
-          build: (context) {
-            return pw.Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children:
-                  chunk.map((value) {
-                    return pw.Container(
-                      width: 180,
-                      height: 60,
-                      decoration: pw.BoxDecoration(
-                        border: pw.Border.all(color: PdfColors.grey300),
-                      ),
-                      child: pw.Column(
-                        mainAxisAlignment: pw.MainAxisAlignment.center,
-                        children: [
-                          pw.Text(
-                            value,
-                            style: pw.TextStyle(
-                              fontSize: 12,
-                              fontWeight: pw.FontWeight.bold,
-                            ),
-                          ),
-                          pw.SizedBox(height: 4),
-                          pw.BarcodeWidget(
-                            barcode: pw.Barcode.code128(),
-                            data: value,
-                            width: 160,
-                            height: 35,
-                            drawText: false,
-                          ),
-                        ],
-                      ),
-                    );
-                  }).toList(),
-            );
-          },
-        ),
-      );
+      // Capture all barcodes
+      for (int i = 0; i < _cellValues.length; i++) {
+        final value = _cellValues[i];
+        final imageBytes = await _captureBarcodeAsImage(value);
+
+        if (imageBytes != null) {
+          // Add image to archive
+          final fileName =
+              'barcode_${value.replaceAll(RegExp(r'[^\w\s-]'), '_')}.png';
+          archive.addFile(ArchiveFile(fileName, imageBytes.length, imageBytes));
+        }
+
+        // Show progress
+        if ((i + 1) % 10 == 0 || i == _cellValues.length - 1) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Processing: ${i + 1}/${_cellValues.length}'),
+              duration: const Duration(milliseconds: 500),
+            ),
+          );
+        }
+      }
+
+      // Encode the archive as ZIP
+      final zipBytes = ZipEncoder().encode(archive);
+
+      if (zipBytes == null) {
+        throw Exception('Failed to create ZIP file');
+      }
+
+      // Download the ZIP file
+      if (kIsWeb) {
+        final anchor =
+            html.AnchorElement(
+                href: 'data:application/zip;base64,${base64Encode(zipBytes)}',
+              )
+              ..setAttribute(
+                'download',
+                'barcodes_${DateTime.now().millisecondsSinceEpoch}.zip',
+              )
+              ..click();
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('ZIP file downloaded successfully!')),
+        );
+      } else {
+        // For mobile, you might want to use path_provider to save to documents
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('ZIP download on mobile requires additional setup'),
+          ),
+        );
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Error creating ZIP: $e')));
+    } finally {
+      setState(() {
+        _isDownloading = false;
+      });
     }
-
-    // Save/Print PDF
-    await Printing.layoutPdf(onLayout: (format) async => pdf.save());
   }
 
   Future<void> _downloadSingleBarcodeAsImage(String value) async {
     try {
-      final key = _barcodeKeys[value];
-      if (key == null || key.currentContext == null) {
+      final pngBytes = await _captureBarcodeAsImage(value);
+
+      if (pngBytes == null) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Failed to capture barcode')),
         );
         return;
       }
 
-      // Find the RenderRepaintBoundary
-      RenderRepaintBoundary boundary =
-          key.currentContext!.findRenderObject() as RenderRepaintBoundary;
-
-      // Capture the image with high quality
-      ui.Image image = await boundary.toImage(pixelRatio: 3.0);
-      ByteData? byteData = await image.toByteData(
-        format: ui.ImageByteFormat.png,
-      );
-
-      if (byteData == null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Failed to generate image')),
-        );
-        return;
-      }
-
-      Uint8List pngBytes = byteData.buffer.asUint8List();
-
       if (kIsWeb) {
-        // For web, trigger download
         final anchor =
             html.AnchorElement(
                 href: 'data:image/png;base64,${base64Encode(pngBytes)}',
@@ -224,7 +252,6 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
               ..setAttribute('download', 'barcode_$value.png')
               ..click();
       } else {
-        // For mobile/desktop, save to gallery
         final result = await ImageGallerySaver.saveImage(
           pngBytes,
           name: 'barcode_$value',
@@ -255,23 +282,10 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
     return Scaffold(
       backgroundColor: CupertinoColors.white,
       appBar: AppBar(
-        backgroundColor: Colors.blueAccent, // Bright color for contrast
+        backgroundColor: Colors.blueAccent,
         titleSpacing: 0,
         title: Row(
           children: [
-            // const SizedBox(width: 12),
-            // if (_cellValues.isEmpty && )
-            //   const Text(
-            //     'Excel → Barcode Generator',
-            //     style: TextStyle(
-            //       color: Colors.white,
-            //       fontSize: 15,
-            //       fontWeight: FontWeight.bold,
-            //     ),
-            //   ),
-            // const Spacer(),
-
-            // 🔍 Search Bar (visible after upload)
             if (_cellValues.isNotEmpty)
               Expanded(
                 flex: 3,
@@ -305,7 +319,7 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
                               )
                               : null,
                       filled: true,
-                      fillColor: Colors.white, // clear white for visibility
+                      fillColor: Colors.white,
                       border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(30),
                         borderSide: BorderSide.none,
@@ -318,10 +332,7 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
                   ),
                 ),
               ),
-
             const SizedBox(width: 8),
-
-            // 📁 Upload Excel Button (with text for clarity)
             ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.white,
@@ -342,73 +353,43 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
                 style: TextStyle(fontWeight: FontWeight.bold),
               ),
             ),
-
-            // const SizedBox(width: 12),
-            //
-            // // ⬇️ Download All button
-            // if (_cellValues.isNotEmpty)
-            //   ElevatedButton.icon(
-            //     style: ElevatedButton.styleFrom(
-            //       backgroundColor: Colors.white,
-            //       foregroundColor: Colors.green,
-            //       padding: const EdgeInsets.symmetric(
-            //         horizontal: 12,
-            //         vertical: 10,
-            //       ),
-            //       shape: RoundedRectangleBorder(
-            //         borderRadius: BorderRadius.circular(30),
-            //       ),
-            //       elevation: 0,
-            //     ),
-            //     onPressed: _downloadAllAsPDF,
-            //     icon: const Icon(Icons.download, size: 20),
-            //     label: const Text(
-            //       'Download All',
-            //       style: TextStyle(fontWeight: FontWeight.bold),
-            //     ),
-            //   ),
+            const SizedBox(width: 12),
+            if (_cellValues.isNotEmpty)
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.green,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(30),
+                  ),
+                  elevation: 0,
+                ),
+                onPressed: _isDownloading ? null : _downloadAllAsZip,
+                icon:
+                    _isDownloading
+                        ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                        : const Icon(Icons.download, size: 20),
+                label: Text(
+                  _isDownloading ? 'Processing...' : 'Download All',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
             const SizedBox(width: 12),
           ],
         ),
       ),
-
       body: Padding(
         padding: const EdgeInsets.all(12.0),
         child: Column(
           children: [
-            // ElevatedButton.icon(
-            //   onPressed: _pickExcelFile,
-            //   icon: const Icon(Icons.upload_file),
-            //   label: const Text('Upload Excel File'),
-            // ),
-            // if (_cellValues.isNotEmpty) ...[
-            //   const SizedBox(height: 12),
-            //   TextField(
-            //     controller: _searchController,
-            //     decoration: InputDecoration(
-            //       hintText: 'Search barcodes...',
-            //       prefixIcon: const Icon(Icons.search),
-            //       suffixIcon:
-            //           _searchController.text.isNotEmpty
-            //               ? IconButton(
-            //                 icon: const Icon(Icons.clear),
-            //                 onPressed: () {
-            //                   _searchController.clear();
-            //                   _filterBarcodes('');
-            //                 },
-            //               )
-            //               : null,
-            //       border: OutlineInputBorder(
-            //         borderRadius: BorderRadius.circular(8),
-            //       ),
-            //       contentPadding: const EdgeInsets.symmetric(
-            //         horizontal: 16,
-            //         vertical: 12,
-            //       ),
-            //     ),
-            //     onChanged: _filterBarcodes,
-            //   ),
-            // ],
             const SizedBox(height: 12),
             Expanded(
               child:
@@ -423,7 +404,7 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
                       : GridView.builder(
                         gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
                           crossAxisCount: crossAxisCount,
-                          childAspectRatio: 3 / 1.2,
+                          childAspectRatio: 14 / 5,
                           crossAxisSpacing: 12,
                           mainAxisSpacing: 12,
                         ),
@@ -432,82 +413,129 @@ class _ExcelBarcodeGeneratorState extends State<ExcelBarcodeGenerator> {
                           final value = _filteredValues[index];
                           return Card(
                             elevation: 3,
+                            clipBehavior: Clip.antiAlias,
                             child: Stack(
                               children: [
                                 RepaintBoundary(
                                   key: _barcodeKeys[value],
                                   child: Container(
                                     color: Colors.white,
-                                    child: Padding(
-                                      padding: const EdgeInsets.symmetric(
-                                        horizontal: 8,
-                                        vertical: 6,
-                                      ),
-                                      child: LayoutBuilder(
-                                        builder: (context, constraints) {
-                                          double textSize =
-                                              constraints.maxWidth *
-                                              0.12; // scales with card width
-                                          textSize = textSize.clamp(
-                                            14,
-                                            28,
-                                          ); // min/max font size limit
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 8,
+                                    ),
+                                    child: LayoutBuilder(
+                                      builder: (context, constraints) {
+                                        // Calculate available space
+                                        final availableHeight =
+                                            constraints.maxHeight;
+                                        final availableWidth =
+                                            constraints.maxWidth;
 
-                                          return Column(
-                                            mainAxisAlignment:
-                                                MainAxisAlignment.center,
-                                            children: [
-                                              // Barcode text (same style as image)
-                                              Padding(
-                                                padding: const EdgeInsets.only(
-                                                  bottom: 0,
-                                                ),
-                                                child: Text(
-                                                  value,
-                                                  textAlign: TextAlign.center,
-                                                  style: TextStyle(
-                                                    fontSize: textSize,
-                                                    fontWeight: FontWeight.w700,
-                                                    letterSpacing: 1.2,
-                                                  ),
-                                                ),
-                                              ),
+                                        // Calculate barcode with perfect 14:4 aspect ratio
+                                        // Aspect ratio 14:4 means width:height = 14:4 = 3.5:1
+                                        // So width = height * 3.5
 
-                                              // Barcode image with fixed height ratio
-                                              Expanded(
-                                                child: Center(
-                                                  child: BarcodeWidget(
-                                                    barcode: Barcode.code128(),
-                                                    data: value,
-                                                    drawText: false,
-                                                    width:
-                                                        constraints.maxWidth *
-                                                        0.9,
-                                                    height:
-                                                        constraints.maxHeight *
-                                                        0.55,
-                                                  ),
-                                                ),
+                                        // Try to fit within available space
+                                        double barcodeHeight;
+                                        double barcodeWidth;
+
+                                        // Calculate based on width constraint
+                                        final maxWidthBasedHeight =
+                                            availableWidth / 3.5;
+                                        // Calculate based on height constraint
+                                        final maxHeightBasedWidth =
+                                            availableHeight * 3.5;
+
+                                        if (maxWidthBasedHeight <=
+                                            availableHeight) {
+                                          // Width is the limiting factor
+                                          barcodeHeight = maxWidthBasedHeight;
+                                          barcodeWidth = availableWidth;
+                                        } else {
+                                          // Height is the limiting factor
+                                          barcodeHeight = availableHeight;
+                                          barcodeWidth = maxHeightBasedWidth;
+
+                                          // If width exceeds available space, scale down
+                                          if (barcodeWidth > availableWidth) {
+                                            barcodeWidth = availableWidth;
+                                            barcodeHeight = barcodeWidth / 3.5;
+                                          }
+                                        }
+
+                                        // Text size: 20% of current (which was 10% of barcode height)
+                                        // So new text size = 2% of barcode height
+                                        final textSize = barcodeHeight * 0.02;
+
+                                        return Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: [
+                                            // Barcode with perfect 14:4 aspect ratio
+                                            SizedBox(
+                                              height: barcodeHeight,
+                                              width: barcodeWidth,
+                                              child: BarcodeWidget(
+                                                barcode: Barcode.code128(),
+                                                data: value,
+                                                drawText: false,
                                               ),
-                                            ],
-                                          );
-                                        },
-                                      ),
+                                            ),
+                                            // No space between barcode and text
+                                            // Text below barcode - very small font (20% of previous size)
+                                            Text(
+                                              value,
+                                              textAlign: TextAlign.center,
+                                              style: GoogleFonts.robotoMono(
+                                                fontSize: 10,
+                                                fontWeight: FontWeight.w900,
+                                                letterSpacing: 0.001,
+                                                color: Colors.black,
+                                              ),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ],
+                                        );
+                                      },
                                     ),
                                   ),
                                 ),
                                 Positioned(
                                   top: 4,
                                   right: 4,
-                                  child: IconButton(
-                                    icon: const Icon(Icons.download, size: 24),
-                                    padding: EdgeInsets.zero,
-                                    constraints: const BoxConstraints(),
-                                    onPressed:
-                                        () => _downloadSingleBarcodeAsImage(
-                                          value,
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      color: Colors.green,
+                                      shape: BoxShape.circle,
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: Colors.green.withOpacity(0.5),
+                                          blurRadius: 6,
+                                          spreadRadius: 1,
+                                          offset: const Offset(0, 2),
                                         ),
-                                    tooltip: 'Download as image',
+                                      ],
+                                    ),
+                                    child: IconButton(
+                                      icon: const Icon(
+                                        Icons.download,
+                                        size: 20,
+                                        color: Colors.white,
+                                      ),
+                                      padding: EdgeInsets.zero,
+                                      constraints: const BoxConstraints(
+                                        minWidth: 36,
+                                        minHeight: 36,
+                                      ),
+                                      onPressed:
+                                          () => _downloadSingleBarcodeAsImage(
+                                            value,
+                                          ),
+                                      tooltip: 'Download as image',
+                                    ),
                                   ),
                                 ),
                               ],
